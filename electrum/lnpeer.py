@@ -1199,16 +1199,22 @@ class Peer(Logger):
             f'(their_next_local_ctn={their_next_local_ctn}, '
             f'their_oldest_unrevoked_remote_ctn={their_oldest_unrevoked_remote_ctn},')
 
-        if not chan:
-            assert self.is_peerbackup_client() # see maybe_resuming
+        if self.is_peerbackup_client(): # see maybe_resuming
             peerbackup = msg['channel_reestablish_tlvs'].get('peerbackup')
             if peerbackup:
                 # todo: verify_peerbackup_signature if chan is None
                 self.logger.info('reconstructing channel')
-                chan = Channel.from_peerbackup(peerbackup['state'], lnworker=self.lnworker)
-                self.lnworker.add_new_channel(chan)
-            else:
-                raise RemoteMisbehaving(f"channel reestablish: peerbackup missing")
+                state = Channel.from_peerbackup(peerbackup['state'], lnworker=self.lnworker)
+                if not chan:
+                    channel_id = state["channel_id"]
+                    channels = self.lnworker.db.get_dict("channels")
+                    # this does type conversion
+                    channels[channel_id] = state
+                    storage = channels[channel_id]
+                    chan = Channel(storage, lnworker=self.lnworker)
+                    self.lnworker.add_new_channel(chan)
+            #else:
+            #    raise RemoteMisbehaving(f"channel reestablish: peerbackup missing")
 
         # sanity checks of received values
         if their_next_local_ctn < 0:

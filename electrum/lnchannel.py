@@ -29,6 +29,7 @@ import time
 import threading
 from abc import ABC, abstractmethod
 import itertools
+from copy import deepcopy
 
 from aiorpcx import NetAddress
 import attr
@@ -1759,7 +1760,7 @@ class Channel(AbstractChannel):
             self.logger.info(f'receive_new_peerbackup {owner}: good signature')
 
         peerbackup_bytes = self.encode_peerbackup(peerbackup_with_timestamps)
-        ctn = peerbackup['log']['1' if owner == LOCAL else '-1']['ctn']
+        ctn = peerbackup['local_ctn' if owner == LOCAL else 'remote_ctn']
         key = 'their_signed_remote_peerbackup' if owner == REMOTE else 'their_signed_local_peerbackup'
         self.storage[key] = ctn, peerbackup_bytes.hex(), signature.hex()
 
@@ -1787,6 +1788,47 @@ class Channel(AbstractChannel):
         # revack pending will be reconstructed
         state['log']['1'].pop('revack_pending')
         state['log']['-1'].pop('revack_pending')
+
+        # convert log to a list of htlcs
+        htlc_log = {LOCAL:{}, REMOTE:{}}
+        fee_updates_log = {LOCAL:{}, REMOTE:{}}
+
+        #def get_capped_ctn(d, owner):
+        #    local_locked_in = log[proposer]['locked_in'].get(htlc_id, {}).get(LOCAL)
+        for proposer in [LOCAL, REMOTE]:
+            log = self.hm.log
+            for htlc_id, add in log[proposer]['adds'].items():
+                local_locked_in = log[proposer]['locked_in'].get(htlc_id, {}).get(LOCAL)
+                local_settle = log[proposer]['settles'].get(htlc_id, {}).get(LOCAL)
+                local_fail = log[proposer]['fails'].get(htlc_id, {}).get(LOCAL)
+                if local_locked_in is not None and local_locked_in > self.hm.ctn_latest(LOCAL):
+                    local_locked_in = None
+                if local_settle is not None and local_settle > self.hm.ctn_latest(LOCAL):
+                    local_settle = None
+                if local_fail is not None and local_fail > self.hm.ctn_latest(LOCAL):
+                    local_fail = None
+                remote_locked_in = log[proposer]['locked_in'].get(htlc_id, {}).get(REMOTE)
+                remote_settle = log[proposer]['settles'].get(htlc_id, {}).get(REMOTE)
+                remote_fail = log[proposer]['fails'].get(htlc_id, {}).get(REMOTE)
+                if remote_locked_in is not None and remote_locked_in > self.hm.ctn_latest(REMOTE):
+                    remote_locked_in = None
+                if remote_settle is not None and remote_settle > self.hm.ctn_latest(REMOTE):
+                    remote_settle = None
+                if remote_fail is not None and remote_fail > self.hm.ctn_latest(REMOTE):
+                    remote_fail = None
+                if local_locked_in is not None or remote_locked_in is not None:
+                    htlc_log[proposer][htlc_id] = (
+                        add,
+                        local_locked_in, local_settle, local_fail,
+                        remote_locked_in, remote_settle, remote_fail
+                    )
+            for update_id, fee_update in log[proposer]['fee_updates'].items():
+                rate = fee_update.rate
+                ctn_local = fee_update.ctn_local
+                ctn_remote = fee_update.ctn_remote
+                if ctn_local is not None or ctn_remote is not None:
+                    fee_updates_log[proposer][update_id] = (rate, ctn_local, ctn_remote)
+
         # create peerbackup
         peerbackup = {
             'channel_id': state['channel_id'],
@@ -1798,7 +1840,10 @@ class Channel(AbstractChannel):
             'funding_outpoint': state['funding_outpoint'],
             'local_config': state['local_config'],
             'remote_config': state['remote_config'],
-            'log': state['log'],
+            'local_ctn': state['log']['1']['ctn'],
+            'remote_ctn': state['log']['-1']['ctn'],
+            'htlc_log': json.loads(json.dumps(htlc_log, cls=util.MyEncoder)),
+            'fee_updates_log': json.loads(json.dumps(fee_updates_log, cls=util.MyEncoder)),
             'revocation_store': state['revocation_store'],
         }
         return peerbackup
@@ -1811,17 +1856,23 @@ class Channel(AbstractChannel):
             d[key_b] = a
         # flip values of log and config
         state = self.get_our_peerbackup()
-        log = state['log']
         flip_values(state, 'local_config', 'remote_config')
-        flip_values(log, '-1', '1')
-        for htlc_proposer in ['-1', '1']:
-            for subkey in ['locked_in', 'settles', 'fails']:
-                d = log[htlc_proposer][subkey]
-                for htlc_id in list(d.keys()):
-                    flip_values(d[htlc_id], '-1', '1')
-            d = log[htlc_proposer]['fee_updates']
-            for k in list(d.keys()):
-                flip_values(d[k], 'ctn_local', 'ctn_remote')
+        flip_values(state, 'local_ctn', 'remote_ctn')
+
+        htlc_log = state['htlc_log']
+        flip_values(htlc_log, '-1', '1')
+        for proposer in ['-1', '1']:
+            for htlc_id, v in list(htlc_log[proposer].items()):
+                add, local_locked_in, local_settle, local_fail, remote_locked_in, remote_settle, remote_fail = v
+                htlc_log[proposer][htlc_id] = add, remote_locked_in, remote_settle, remote_fail, local_locked_in, local_settle, local_fail
+
+        fee_updates_log = state['fee_updates_log']
+        flip_values(fee_updates_log, '-1', '1')
+        for proposer in ['-1', '1']:
+            for fee_update_id, v in list(fee_updates_log[proposer].items()):
+                fee_update, local_ctn, remote_ctn = v
+                fee_updates_log[proposer][fee_update_id] = fee_update, remote_ctn, local_ctn
+
         state['constraints']['is_initiator'] = not state['constraints']['is_initiator']
         state['node_id'] = self.lnworker.node_keypair.pubkey.hex()
         return state
@@ -1844,54 +1895,35 @@ class Channel(AbstractChannel):
         #    <--CS---
         #    ---Rev->         bob: receive_new_peerbackup(their_local)  alice: get_our_signed_peerbackup(local)
 
-        is_cs = is_remote = (owner == REMOTE)
-        is_rev = not is_cs
-        log = state['log']
-
-        if is_client:
-            ctn_latest_local = self.hm.ctn_latest(LOCAL)
-            ctn_latest_remote = self.hm.ctn_latest(REMOTE)
-        else:
-            ctn_latest_local = self.hm.ctn_latest(REMOTE)
-            ctn_latest_remote = self.hm.ctn_latest(LOCAL)
-
-        self.logger.info(f'building peerbackup {owner}: {ctn_latest_local} {ctn_latest_remote}')
-        # remove other ctn
-        bool_to_key = lambda b : '1' if b else '-1'
-        log[bool_to_key(is_remote)].pop('ctn')
-        # remove ctns in htlc log
-        for htlc_proposer in ['-1', '1']:
-            we_proposed = htlc_proposer == '1'
-            for subkey in ['locked_in', 'settles', 'fails']:
-                d = log[htlc_proposer][subkey]
-                for htlc_id in list(d.keys()):
-                    # compute which side will be removed
-                    if subkey == 'locked_in':
-                        to_remove = is_remote != we_proposed
-                    else:
-                        to_remove = is_remote != (not we_proposed)
-                    to_keep = not to_remove
-                    #self.logger.info(f'log[{htlc_proposer}][{htlc_id}] {d[htlc_id]}: keeping {bool_to_key(not to_remove)}')
-                    removed_ctn = d[htlc_id].pop(bool_to_key(to_remove))
-                    kept_ctn = d[htlc_id][bool_to_key(to_keep)]
-                    if kept_ctn is None:
-                        d.pop(htlc_id)
-                    else:
-                        if is_rev and removed_ctn is None:
-                            if kept_ctn > (ctn_latest_local if to_keep else ctn_latest_remote):
-                                d.pop(htlc_id)
-                                self.logger.info(f"popping [{subkey}] '{LOCAL if to_keep else REMOTE}' because {kept_ctn} too high")
-            # rm adds that are not locked in
-            adds = log[htlc_proposer]['adds']
-            for htlc_id in list(adds.keys()):
-                if htlc_id not in log[htlc_proposer]['locked_in']:
-                    adds.pop(htlc_id)
-
-            d = log[htlc_proposer]['fee_updates']
-            for k in list(d.keys()):
-                d[k].pop('ctn_local' if owner == REMOTE else 'ctn_remote')
-
         state.pop('local_config' if owner == REMOTE  else 'remote_config')
+        state.pop('local_ctn' if owner == REMOTE  else 'remote_ctn')
+        # blank fields
+        htlc_log = state['htlc_log']
+        for proposer in ['-1', '1']:
+            for htlc_id, v in list(htlc_log[proposer].items()):
+                add, local_locked_in, local_settle, local_fail, remote_locked_in, remote_settle, remote_fail = v
+                if owner == REMOTE:
+                    local_locked_in = local_settle = local_fail = None
+                else:
+                    remote_locked_in = remote_settle = remote_fail = None
+                if local_locked_in is not None or remote_locked_in is not None:
+                    htlc_log[proposer][htlc_id] = add, local_locked_in, local_settle, local_fail, remote_locked_in, remote_settle, remote_fail
+                else:
+                    htlc_log[proposer].pop(htlc_id)
+        # blank fields
+        fee_updates_log = state['fee_updates_log']
+        for proposer in ['-1', '1']:
+            for fee_update_id, v in list(fee_updates_log[proposer].items()):
+                fee_update, local_ctn, remote_ctn = v
+                if owner == REMOTE:
+                    local_ctn = None
+                else:
+                    remote_ctn = None
+                if local_ctn is not None or remote_ctn is not None:
+                    fee_updates_log[proposer][fee_update_id] = fee_update, local_ctn, remote_ctn
+                else:
+                    fee_updates_log[proposer].pop(fee_update_id)
+
         # revocation store is not part of local
         if owner == LOCAL:
             state.pop('revocation_store')
@@ -1899,14 +1931,14 @@ class Channel(AbstractChannel):
         return state
 
     def remove_timestamps(self, state) -> dict:
-        import copy
-        state2 = copy.deepcopy(state)
-        log = state2['log']
+        state = deepcopy(state)
+        log = state['htlc_log']
         for htlc_proposer in ['-1', '1']:
-            adds = log[htlc_proposer]['adds']
-            for htlc_id in list(adds.keys()):
-                adds[htlc_id][4] = 0
-        return state2
+            for htlc_id, v in list(log[htlc_proposer].items()):
+                a, b, c, d, e, f, g = v
+                a[4] = 0
+                log[htlc_proposer][htlc_id] = a, b, c, d, e, f, g
+        return state
 
     def get_our_signed_peerbackup(self, owner) -> dict:
         """client method"""
@@ -1985,32 +2017,52 @@ class Channel(AbstractChannel):
         ##
         local_peerbackup['revocation_store'] = remote_peerbackup['revocation_store']
         local_peerbackup['remote_config'] = remote_peerbackup['remote_config']
-        local_log = local_peerbackup['log']
         remote_peerbackup['local_config'] = local_peerbackup['local_config']
-        remote_log = remote_peerbackup['log']
         #
-        local_log['-1']['ctn'] = remote_log['-1']['ctn']
-        remote_log['1']['ctn'] = local_log['1']['ctn']
+        remote_peerbackup['local_ctn'] = local_peerbackup['local_ctn']
+        local_peerbackup['remote_ctn'] = remote_peerbackup['remote_ctn']
         #
-        for _owner in ['-1', '1']:
-            for subkey in ['locked_in', 'settles', 'fails']:
-                d_l = local_log[_owner][subkey]
-                d_r = remote_log[_owner][subkey]
-                for htlc_id in list(d_l.keys()):
-                    if htlc_id not in d_r:
-                        d_r[htlc_id] = {'-1': None, '1': None}
-                    d_r[htlc_id].update(d_l[htlc_id])
-                for htlc_id in list(d_r.keys()):
-                    if htlc_id not in d_l:
-                        d_r[htlc_id] = {'-1': None, '1': None}
-                    d_l[htlc_id].update(d_r[htlc_id])
+        # merge htlc logs
+        local_htlc_log = local_peerbackup['htlc_log']
+        remote_htlc_log = remote_peerbackup['htlc_log']
+        for proposer in ['-1', '1']:
+            for htlc_id, local_v in list(local_htlc_log[proposer].items()):
+                remote_v = remote_htlc_log[proposer].get(htlc_id)
+                if remote_v:
+                    add, local_locked_in, local_settle, local_fail, _, _, _ = local_v
+                    add2, _, _, _, remote_locked_in, remote_settle, remote_fail = remote_v
+                    assert add2 == add
+                    local_htlc_log[proposer][htlc_id] = add, local_locked_in, local_settle, local_fail, remote_locked_in, remote_settle, remote_fail
+        for proposer in ['-1', '1']:
+            for htlc_id, remote_v in list(remote_htlc_log[proposer].items()):
+                local_v = local_htlc_log[proposer].get(htlc_id)
+                if local_v:
+                    add, local_locked_in, local_settle, local_fail, _, _, _ = local_v
+                    add2, _, _, _, remote_locked_in, remote_settle, remote_fail = remote_v
+                    assert add2 == add
+                    remote_htlc_log[proposer][htlc_id] = add, local_locked_in, local_settle, local_fail, remote_locked_in, remote_settle, remote_fail
+        assert local_htlc_log == remote_htlc_log
 
-            d_l = local_log[_owner]['fee_updates']
-            d_r = remote_log[_owner]['fee_updates']
-            for k in list(d_l.keys()):
-                d_r[k]['ctn_local'] = d_l[k]['ctn_local']
-            for k in list(d_r.keys()):
-                d_l[k]['ctn_remote'] = d_r[k]['ctn_remote']
+        # merge fee_update logs
+        local_fee_updates_log = local_peerbackup['fee_updates_log']
+        remote_fee_updates_log = remote_peerbackup['fee_updates_log']
+        for proposer in ['-1', '1']:
+            for fee_update_id, local_v in list(local_fee_updates_log[proposer].items()):
+                remote_v = remote_fee_updates_log[proposer].get(fee_update_id)
+                if remote_v:
+                    rate, local_ctn, _= local_v
+                    rate2, _, remote_ctn = remote_v
+                    assert rate == rate2
+                    local_fee_updates_log[proposer][fee_update_id] = rate, local_ctn, remote_ctn
+        for proposer in ['-1', '1']:
+            for fee_update_id, remote_v in list(remote_fee_updates_log[proposer].items()):
+                local_v = local_fee_updates_log[proposer].get(fee_update_id)
+                if local_v:
+                    rate, local_ctn, _= local_v
+                    rate2, _, remote_ctn = remote_v
+                    assert rate == rate2
+                    remote_fee_updates_log[proposer][fee_update_id] = rate, local_ctn, remote_ctn
+        assert local_fee_updates_log == remote_fee_updates_log
 
         if local_peerbackup != remote_peerbackup:
             if cls.DEBUG_PEERBACKUP:
@@ -2095,13 +2147,12 @@ class Channel(AbstractChannel):
         if not ECPubkey(pubkey).ecdsa_verify(signature, sighash):
             raise Exception(f'incorrect peerbackup signature: {owner}')
         self.logger.info(f'good peerbackup signature {owner}')
-        return state['log']['1' if owner==LOCAL else '-1']['ctn']
+        return state['local_ctn' if owner==LOCAL else 'remote_ctn']
 
     @classmethod
     def from_peerbackup(cls, data_bytes: bytes, lnworker):
         from .lnutil import BIP32Node, generate_keypair, LnKeyFamily
         state = cls.decode_peerbackup(data_bytes)
-        channels = lnworker.db.get_dict("channels")
         #channel_id = self.channel_id.hex()
         #assert channel_id in channels
         local_config = state['local_config']
@@ -2120,7 +2171,30 @@ class Channel(AbstractChannel):
         state['onion_keys'] = {}
         state['unfulfilled_htlcs'] = {}
         state['peer_network_addresses'] = {}
+        # rebuild the log from local and remote
+        from .lnhtlc import initial
+        log = {
+            '1': deepcopy(initial),
+            '-1': deepcopy(initial)
+        }
+        for proposer in ['-1', '1']:
+            for htlc_id, v in state['htlc_log'][proposer].items():
+                add, local_locked_in, local_settle, local_fail, remote_locked_in, remote_settle, remote_fail = v
+                log[proposer]['adds'][htlc_id] = add
+                assert local_locked_in is not None or remote_locked_in is not None
+                log[proposer]['locked_in'][htlc_id] = {'1':local_locked_in, '-1':remote_locked_in}
+                if local_settle is not None or remote_settle is not None:
+                    log[proposer]['settles'][htlc_id] = {'1':local_settle, '-1':remote_settle}
+                if local_fail is not None or remote_fail is not None:
+                    log[proposer]['fails'][htlc_id] = {'1':local_fail, '-1':remote_fail}
+            for fee_update_id, v in state['fee_updates_log'][proposer].items():
+                rate, local_ctn, remote_ctn = v
+                log[proposer]['fee_updates'][fee_update_id] = {'rate':rate, 'ctn_local':local_ctn, 'ctn_remote':remote_ctn}
 
+        log['1']['ctn'] = state.pop('local_ctn')
+        log['-1']['ctn'] = state.pop('remote_ctn')
+        lnworker.logger.info(f'{log}')
+        state['log'] = log
         state['log']['1']['was_revoke_last'] = False
         state['log']['1']['unacked_updates'] = {}
         # restore next_htlc_id
@@ -2133,10 +2207,4 @@ class Channel(AbstractChannel):
         log['-1']['revack_pending'] = True
         # assume OPEN
         state['state'] = 'OPEN'
-
-        channel_id = state["channel_id"]
-        # this does type conversion
-        channels[channel_id] = state
-        storage = channels[channel_id]
-        chan = cls(storage, lnworker=lnworker)
-        return chan
+        return state
